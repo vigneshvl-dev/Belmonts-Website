@@ -236,7 +236,7 @@ const DEFAULT_QUIZ_QUESTIONS = [
   }
 ];
 
-export function flattenPresence(presenceState, currentEmail) {
+export function flattenPresence(presenceState, currentEmail, currentSessionId = '') {
   if (!presenceState || typeof presenceState !== 'object') return [];
   const userMap = new Map();
   const normalizedCurrentEmail = (currentEmail || '').trim().toLowerCase();
@@ -245,19 +245,22 @@ export function flattenPresence(presenceState, currentEmail) {
     if (Array.isArray(presenceArray)) {
       presenceArray.forEach((user) => {
         if (!user) return;
-        const userKey = (user.email || user.id || '').trim().toLowerCase();
+        // Key by unique session id or id if available, fallback to email
+        const userKey = (user.sessionId || user.id || user.email || '').trim();
         if (!userKey) return;
 
         if (!userMap.has(userKey)) {
-          const isMe = user.email
-            ? user.email.trim().toLowerCase() === normalizedCurrentEmail
-            : userKey === normalizedCurrentEmail;
+          const isMe = Boolean(
+            (currentSessionId && (user.sessionId === currentSessionId || user.id === currentSessionId)) ||
+            (!currentSessionId && user.email && user.email.trim().toLowerCase() === normalizedCurrentEmail)
+          );
           const isHost = Boolean(user.isHost || user.is_host);
 
           userMap.set(userKey, {
             id: user.id || userKey,
+            sessionId: user.sessionId || userKey,
             name: user.name || 'Participant',
-            email: user.email || userKey,
+            email: user.email || '',
             avatar: user.avatar || (user.name ? user.name.charAt(0).toUpperCase() : 'P'),
             isHost,
             status: user.status || 'Ready',
@@ -276,6 +279,54 @@ export function flattenPresence(presenceState, currentEmail) {
     if (a.isHost && !b.isHost) return -1;
     if (!a.isHost && b.isHost) return 1;
     return (a.joinedAt || 0) - (b.joinedAt || 0);
+  });
+}
+
+export function normalizeLeaderboardEntry(row) {
+  if (!row) return null;
+  const score = typeof row.score === 'number' ? row.score : Number(row.score) || 0;
+  const correctCount = typeof row.correctCount === 'number' ? row.correctCount : (typeof row.correct_count === 'number' ? row.correct_count : 0);
+  const wrongCount = typeof row.wrongCount === 'number' ? row.wrongCount : (typeof row.wrong_count === 'number' ? row.wrong_count : 0);
+  const unattemptedCount = typeof row.unattemptedCount === 'number' ? row.unattemptedCount : (typeof row.unattempted_count === 'number' ? row.unattempted_count : 0);
+  const maxPoints = typeof row.maxPoints === 'number' ? row.maxPoints : (typeof row.max_points === 'number' ? row.max_points : 100);
+  const percentage = typeof row.percentage === 'number' ? row.percentage : (typeof row.accuracy === 'number' ? row.accuracy : 0);
+  const timeTaken = typeof row.timeTaken === 'number' ? row.timeTaken : (typeof row.time_taken === 'number' ? row.time_taken : 0);
+
+  return {
+    id: row.id || `sub_${row.email || Math.random()}`,
+    name: row.name || 'Participant',
+    email: row.email || '',
+    score,
+    maxPoints,
+    correctCount,
+    wrongCount,
+    unattemptedCount,
+    totalQuestions: row.totalQuestions || row.total_questions || 20,
+    percentage,
+    accuracy: percentage,
+    timeTaken,
+    completedAt: row.completedAt || row.completed_at || Date.now(),
+    answers: row.answers || {},
+    isHost: Boolean(row.isHost || (row.email && row.email.toLowerCase() === ADMIN_EMAIL.toLowerCase()))
+  };
+}
+
+export function sortLeaderboard(list) {
+  if (!Array.isArray(list)) return [];
+  const map = new Map();
+  list.forEach(item => {
+    const norm = normalizeLeaderboardEntry(item);
+    if (!norm) return;
+    const key = (norm.email || norm.id).trim().toLowerCase();
+    // Keep highest score or most recent
+    if (!map.has(key) || (map.get(key).score < norm.score)) {
+      map.set(key, norm);
+    }
+  });
+
+  return Array.from(map.values()).sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return (a.timeTaken || 0) - (b.timeTaken || 0);
   });
 }
 
@@ -313,10 +364,7 @@ function getStoredLeaderboard() {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return parsed.sort((a, b) => {
-          if (b.score !== a.score) return b.score - a.score;
-          return (a.timeTaken || 0) - (b.timeTaken || 0);
-        });
+        return sortLeaderboard(parsed);
       }
     }
   } catch {
@@ -403,6 +451,24 @@ export default function QuantumQuiz() {
     });
   }, []);
 
+  // Persistent session ID per browser tab to avoid presence key collisions
+  const sessionIdRef = useRef(
+    (() => {
+      if (typeof window !== 'undefined' && window.sessionStorage) {
+        let storedId = window.sessionStorage.getItem('HYNA_TAB_SESSION_ID');
+        if (!storedId) {
+          storedId = 'tab_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now();
+          try {
+            window.sessionStorage.setItem('HYNA_TAB_SESSION_ID', storedId);
+          } catch {}
+        }
+        return storedId;
+      }
+      return 'tab_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now();
+    })()
+  );
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
+
   // Shared Real-Time Waiting Room state (populated via Supabase Realtime Presence)
   const [teammates, setTeammates] = useState([]);
   const [lobbyNotice, setLobbyNotice] = useState('Waiting for session host to initiate quiz...');
@@ -473,6 +539,54 @@ export default function QuantumQuiz() {
   const [showLeaderboard, setShowLeaderboard] = useState(getStoredLeaderboardVisibility);
   const [inspectParticipant, setInspectParticipant] = useState(null);
 
+  // Global Leaderboard Fetcher from Supabase Cloud Database
+  const fetchLeaderboardFromCloud = async () => {
+    try {
+      if (supabase) {
+        const { data, error } = await supabase
+          .from('quiz_submissions')
+          .select('*')
+          .order('score', { ascending: false });
+
+        if (!error && Array.isArray(data)) {
+          const sorted = sortLeaderboard(data);
+          setLeaderboard(sorted);
+          try {
+            localStorage.setItem('HYNA_QUIZ_LEADERBOARD', JSON.stringify(sorted));
+          } catch {}
+          return sorted;
+        }
+      }
+    } catch (err) {
+      console.warn('Error fetching leaderboard from Supabase:', err);
+    }
+
+    try {
+      const res = await fetch('/api/quiz/leaderboard');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const sorted = sortLeaderboard(data);
+          setLeaderboard(sorted);
+          return sorted;
+        }
+      }
+    } catch {}
+
+    return getStoredLeaderboard();
+  };
+
+  // Synchronize leaderboard on initial mount & periodic sync when leaderboard or results active
+  useEffect(() => {
+    fetchLeaderboardFromCloud();
+    const interval = setInterval(() => {
+      if (stage === 'QUIZ_RESULTS' || showLeaderboard) {
+        fetchLeaderboardFromCloud();
+      }
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [stage, showLeaderboard]);
+
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'instant' });
   }, [stage]);
@@ -506,7 +620,7 @@ export default function QuantumQuiz() {
     const channel = supabase.channel(channelName, {
       config: {
         presence: {
-          key: trimmedEmail,
+          key: sessionIdRef.current,
         },
       },
     });
@@ -516,7 +630,7 @@ export default function QuantumQuiz() {
     // 1. Presence Sync - Fires automatically when any participant enters or leaves the room
     channel.on('presence', { event: 'sync' }, () => {
       const state = channel.presenceState();
-      const allUsers = flattenPresence(state, userEmailRef.current);
+      const allUsers = flattenPresence(state, userEmailRef.current, sessionIdRef.current);
       setTeammates(allUsers);
       try {
         localStorage.setItem('HYNA_LOBBY_PARTICIPANTS', JSON.stringify(allUsers));
@@ -534,6 +648,7 @@ export default function QuantumQuiz() {
     // 3. Realtime Broadcast: Leaderboard Reveal
     channel.on('broadcast', { event: 'LEADERBOARD_REVEAL' }, () => {
       setShowLeaderboard(true);
+      fetchLeaderboardFromCloud();
     });
 
     // 4. Realtime Broadcast: Leaderboard Hide
@@ -544,23 +659,28 @@ export default function QuantumQuiz() {
     // 5. Realtime Broadcast: Live Leaderboard Submissions
     channel.on('broadcast', { event: 'LEADERBOARD_SUBMISSION' }, (event) => {
       const submission = event?.payload?.submission;
-      if (submission && submission.email) {
+      if (submission) {
         setLeaderboard((prev) => {
-          const filtered = prev.filter(
-            (p) => p.email?.toLowerCase() !== submission.email.toLowerCase()
-          );
-          const updated = [...filtered, submission].sort(
-            (a, b) => (b.score - a.score) || ((a.timeTaken || 0) - (b.timeTaken || 0))
-          );
+          const updated = sortLeaderboard([...prev, submission]);
           try {
             localStorage.setItem('HYNA_QUIZ_LEADERBOARD', JSON.stringify(updated));
           } catch {}
           return updated;
         });
       }
+      fetchLeaderboardFromCloud();
     });
 
-    // 6. Realtime Broadcast: Lobby Reset (Host cleared attendees)
+    // 6. Realtime Postgres Changes on quiz_submissions
+    channel.on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'quiz_submissions' },
+      () => {
+        fetchLeaderboardFromCloud();
+      }
+    );
+
+    // 7. Realtime Broadcast: Lobby Reset (Host cleared attendees)
     channel.on('broadcast', { event: 'LOBBY_RESET' }, () => {
       if (!isAdminRef.current) {
         setStage('NAME_ENTRY');
@@ -571,9 +691,11 @@ export default function QuantumQuiz() {
     // Subscribe to channel and track user presence
     channel.subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
+        setRealtimeConnected(true);
         const isUserHost = trimmedEmail === ADMIN_EMAIL.toLowerCase();
         await channel.track({
-          id: `user_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          id: sessionIdRef.current,
+          sessionId: sessionIdRef.current,
           name: trimmedName,
           email: trimmedEmail,
           avatar: trimmedName.charAt(0).toUpperCase(),
@@ -582,15 +704,19 @@ export default function QuantumQuiz() {
           status: 'Ready',
           joinedAt: Date.now(),
         });
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        setRealtimeConnected(false);
       }
     });
 
     // Automatic Reconnection Handler
     const handleOnline = () => {
       if (channel && channel.state === 'joined') {
+        setRealtimeConnected(true);
         const isUserHost = trimmedEmail === ADMIN_EMAIL.toLowerCase();
         channel.track({
-          id: `user_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          id: sessionIdRef.current,
+          sessionId: sessionIdRef.current,
           name: trimmedName,
           email: trimmedEmail,
           avatar: trimmedName.charAt(0).toUpperCase(),
@@ -605,6 +731,7 @@ export default function QuantumQuiz() {
 
     return () => {
       window.removeEventListener('online', handleOnline);
+      setRealtimeConnected(false);
       try {
         channel.untrack();
         supabase.removeChannel(channel);
@@ -741,23 +868,43 @@ export default function QuantumQuiz() {
 
     const userInitial = trimmedName.charAt(0).toUpperCase();
     const userObj = {
-      id: `user_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      id: sessionIdRef.current,
+      sessionId: sessionIdRef.current,
       name: trimmedName,
       email: trimmedEmail,
-      role: adminCheck ? 'Session Host & Admin' : 'Participant',
+      role: adminCheck ? 'Session Host & Admin (You)' : 'Participant (You)',
       status: 'Ready',
       avatar: userInitial,
-      isCurrentUser: false,
+      isCurrentUser: true,
       isHost: adminCheck,
+      joinedAt: Date.now()
     };
 
-    // 1. Post to backend server as fallback
+    // Immediately put current user in teammates so there is ZERO blank waiting time
+    setTeammates((prev) => {
+      const filtered = prev.filter(p => p.id !== userObj.id && p.sessionId !== userObj.sessionId);
+      return [userObj, ...filtered];
+    });
+
+    // 1. Post to backend server & Supabase database
     try {
       fetch('/api/quiz/lobby', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(userObj)
       }).catch(() => {});
+
+      if (supabase) {
+        supabase.from('quiz_participants').upsert({
+          id: sessionIdRef.current,
+          name: trimmedName,
+          email: trimmedEmail,
+          role: adminCheck ? 'Session Host & Admin' : 'Participant',
+          status: 'Ready',
+          avatar: userInitial,
+          is_host: adminCheck
+        }, { onConflict: 'email' }).then(() => {}).catch(() => {});
+      }
     } catch {}
 
     setLobbyNotice(adminCheck ? 'You are host. Ready to launch when you are.' : 'Waiting for session host to initiate quiz...');
@@ -929,11 +1076,7 @@ export default function QuantumQuiz() {
         }
       }
     } else {
-      if (isAdmin) {
-        handleHostRevealLeaderboard();
-      } else {
-        finalizeQuiz(selectedAnswers);
-      }
+      finalizeQuiz(selectedAnswers);
     }
   };
 
@@ -984,18 +1127,12 @@ export default function QuantumQuiz() {
   };
 
   const finalizeQuiz = async (finalAnswers = selectedAnswers) => {
-    // If admin is browsing or ends quiz, admin does NOT get saved as competitor
-    if (isAdmin) {
-      handleHostRevealLeaderboard();
-      return;
-    }
-
     const { points, correctCount, wrongCount, unattemptedCount, accuracy, maxPoints } = getScoreDetails(finalAnswers);
 
     const participantRecord = {
       id: `sub_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      name: userName || 'Participant',
-      email: userEmail || 'anonymous@hyna.studio',
+      name: userName || (isAdmin ? 'Vignesh (Host)' : 'Participant'),
+      email: userEmail || 'participant@hyna.studio',
       score: points,
       maxPoints,
       correctCount,
@@ -1003,22 +1140,36 @@ export default function QuantumQuiz() {
       unattemptedCount,
       totalQuestions: questions.length,
       percentage: accuracy,
+      accuracy,
       timeTaken: totalTimeSpent,
       completedAt: Date.now(),
       answers: finalAnswers,
-      isHost: false
+      isHost: isAdmin
     };
 
-    const currentLb = getStoredLeaderboard();
-    const filtered = currentLb.filter(item => item.email?.toLowerCase() !== userEmail.toLowerCase());
-    const updatedLb = [...filtered, participantRecord].sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return (a.timeTaken || 0) - (b.timeTaken || 0);
+    // 1. Immediately update local state so the user sees their score in the leaderboard table
+    setLeaderboard((prev) => {
+      const updated = sortLeaderboard([...prev, participantRecord]);
+      try {
+        localStorage.setItem('HYNA_QUIZ_LEADERBOARD', JSON.stringify(updated));
+      } catch {}
+      return updated;
     });
 
+    // 2. Broadcast over Supabase Realtime channel to ALL connected devices in the room
     try {
-      localStorage.setItem('HYNA_QUIZ_LEADERBOARD', JSON.stringify(updatedLb));
-      if (isSupabaseConfigured && supabase) {
+      activeChannelRef.current?.send({
+        type: 'broadcast',
+        event: 'LEADERBOARD_SUBMISSION',
+        payload: { submission: participantRecord, roomId }
+      });
+    } catch (err) {
+      console.warn('Realtime submission broadcast error:', err);
+    }
+
+    // 3. Upsert into Supabase database table quiz_submissions
+    try {
+      if (supabase) {
         await supabase.from('quiz_submissions').upsert({
           id: participantRecord.id,
           name: participantRecord.name,
@@ -1035,27 +1186,32 @@ export default function QuantumQuiz() {
           completed_at: new Date().toISOString()
         });
       }
+    } catch (err) {
+      console.warn('Supabase upsert error:', err);
+    }
+
+    // 4. Save to local fallback server
+    try {
       fetch('/api/quiz/leaderboard', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(participantRecord)
       }).catch(() => {});
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     broadcastSync('LEADERBOARD_UPDATE', participantRecord);
-    setLeaderboard(updatedLb);
+
+    // 5. If Host, automatically publish and reveal leaderboard to everyone
+    if (isAdmin) {
+      handleHostRevealLeaderboard();
+    }
+
     setStage('QUIZ_RESULTS');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   const handleSubmitQuiz = () => {
-    if (isAdmin) {
-      handleHostRevealLeaderboard();
-    } else {
-      finalizeQuiz(selectedAnswers);
-    }
+    finalizeQuiz(selectedAnswers);
   };
 
   const toggleLeaderboardPublish = () => {
@@ -1686,9 +1842,9 @@ export default function QuantumQuiz() {
                     Connected Teammates ({teammates.length})
                   </h2>
                   <div className="teammates-header-actions">
-                    <div className="ready-indicator-tag">
-                      <CheckCircle2 size={14} />
-                      <span>Lobby Connected</span>
+                    <div className={`ready-indicator-tag ${realtimeConnected ? 'live-online' : 'connecting'}`}>
+                      <Radio size={14} className={realtimeConnected ? 'pulse-radio-icon' : ''} />
+                      <span>{realtimeConnected ? `Realtime Sync (${roomId})` : 'Connecting to Lobby...'}</span>
                     </div>
                     {isAdmin && teammates.length > 1 && (
                       <button
